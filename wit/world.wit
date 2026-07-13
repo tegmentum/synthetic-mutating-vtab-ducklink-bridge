@@ -1,0 +1,23 @@
+package synthetic:writer@0.1.0;
+
+use duckdb:extension/types@2.0.0;
+use duckdb:extension/storage-write-dispatch@2.0.0;
+
+/// Test-only writer component that exports the `duckdb:extension/
+/// storage-write-dispatch@2.0.0` interface (the WRITABLE half of a storage
+/// backend: transactions + DDL + DML). Companion to the sqlink synthetic
+/// mutating vtab bridge -- exercises the mirror-image path in ducklink.
+///
+/// The component implements `kv_store(key TEXT, value TEXT)` semantics
+/// with process-local `Mutex<KvState>` state (BTreeMap<rowid, (key, value)>
+/// + shadow snapshot; no savepoints -- DuckDB's TransactionManager doesn't
+/// use SAVEPOINT the same way SQLite's vtab-update does).
+///
+/// This world only exports storage-write-dispatch; it deliberately does NOT
+/// export the base `guest` / `callback-dispatch` / read-side `storage-dispatch`.
+/// The boundary test wires up the matching mini-world host-side and drives the
+/// mutating trampolines directly, mirroring how the read-side boundary test
+/// exercises storage-dispatch alone.
+world writer {
+  export duckdb:extension/storage-write-dispatch@2.0.0;
+}

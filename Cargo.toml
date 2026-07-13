@@ -1,0 +1,29 @@
+[package]
+name = "synthetic-mutating-vtab-ducklink-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Test-only writer component exporting duckdb:extension/storage-write-dispatch@2.0.0. Exercises ducklink-runtime's write-side dispatch trampolines end-to-end via a synthetic kv_store(key TEXT, value TEXT) backend."
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+members = ["."]
+
+[lib]
+# The output wasm doubles as the load-time identity. Convention across the
+# tegmentum synthetic bridges: `<name>_dynlink.wasm`. This writer component
+# is NOT a compose:dynlink bridge (no linker import) -- the suffix is kept
+# only for filename symmetry with the sqlink sibling
+# (synthetic_mutating_bridge_dynlink.wasm).
+name = "synthetic_mutating_ducklink_bridge_dynlink"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.41", features = ["macros"] }
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
