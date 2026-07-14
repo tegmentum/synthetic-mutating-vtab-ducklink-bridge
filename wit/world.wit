@@ -1,23 +1,48 @@
-package synthetic:writer@0.1.0;
+package synthetic:writer@0.2.0;
 
-use duckdb:extension/types@2.0.0;
-use duckdb:extension/storage-write-dispatch@2.0.0;
+use duckdb:extension/runtime@4.0.0;
+use duckdb:extension/config@4.0.0;
+use duckdb:extension/logging@4.0.0;
+use duckdb:extension/catalog@4.0.0;
+use duckdb:extension/files@4.0.0;
+use duckdb:extension/storage@4.0.0;
+use duckdb:extension/guest@4.0.0;
+use duckdb:extension/callback-dispatch@4.0.0;
+use duckdb:extension/storage-dispatch@4.0.0;
+use duckdb:extension/storage-write-dispatch@4.0.0;
 
-/// Test-only writer component that exports the `duckdb:extension/
-/// storage-write-dispatch@2.0.0` interface (the WRITABLE half of a storage
-/// backend: transactions + DDL + DML). Companion to the sqlink synthetic
-/// mutating vtab bridge -- exercises the mirror-image path in ducklink.
+/// Full-stack ducklink writer bridge. Mirrors the canonical
+/// `duckdb-extension-storage-write` world at duckdb:extension@4.0.0 --
+/// exports guest + callback-dispatch + storage-dispatch + storage-write-dispatch
+/// so the ducklink CLI can:
 ///
-/// The component implements `kv_store(key TEXT, value TEXT)` semantics
-/// with process-local `Mutex<KvState>` state (BTreeMap<rowid, (key, value)>
-/// + shadow snapshot; no savepoints -- DuckDB's TransactionManager doesn't
-/// use SAVEPOINT the same way SQLite's vtab-update does).
+///   1. LOAD the component (guest.load calls storage.register-storage
+///      to declare the ATTACH TYPE name "synthetic_mutating"),
+///   2. route `ATTACH ... (TYPE synthetic_mutating)` to storage-dispatch
+///      for read-side (attach / list-tables / table-columns / scan-*), and
+///   3. route DDL / DML on the attached catalog to storage-write-dispatch
+///      (begin/commit/rollback + create-table + insert/update/delete).
 ///
-/// This world only exports storage-write-dispatch; it deliberately does NOT
-/// export the base `guest` / `callback-dispatch` / read-side `storage-dispatch`.
-/// The boundary test wires up the matching mini-world host-side and drives the
-/// mutating trampolines directly, mirroring how the read-side boundary test
-/// exercises storage-dispatch alone.
+/// All four exports are backed by the SAME in-guest `Mutex<KvState>` so a
+/// read after a write within the same session (and within the same wasm
+/// instance) observes the mutation.
+///
+/// This world is named `writer` to preserve the crate identity established
+/// by the earlier writer-only bridge (`synthetic:writer@0.1.0`), so any
+/// tooling keying on the export set continues to find the writer surface.
+/// The write_boundary integration test at
+/// `ducklink/crates/storage-boundary-test/tests/write_boundary.rs` binds
+/// against the storage-write-dispatch export directly and is unaffected by
+/// the additional read-side / guest exports.
 world writer {
-  export duckdb:extension/storage-write-dispatch@2.0.0;
+  import runtime;
+  import config;
+  import logging;
+  import catalog;
+  import files;
+  import storage;
+  export guest;
+  export callback-dispatch;
+  export storage-dispatch;
+  export storage-write-dispatch;
 }

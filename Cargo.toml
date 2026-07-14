@@ -1,8 +1,8 @@
 [package]
 name = "synthetic-mutating-vtab-ducklink-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Test-only writer component exporting duckdb:extension/storage-write-dispatch@2.0.0. Exercises ducklink-runtime's write-side dispatch trampolines end-to-end via a synthetic kv_store(key TEXT, value TEXT) backend."
+description = "Test-only full-stack storage bridge for the ducklink CLI. Exports guest + callback-dispatch + storage-dispatch + storage-write-dispatch (duckdb:extension@4.0.0) so LOAD + ATTACH ':memory:' AS kv (TYPE synthetic_mutating) plus CRUD round-trip end-to-end against an in-guest synthetic kv_store(key TEXT, value TEXT). Companion to the sqlink synthetic-mutating-vtab-bridge."
 license = "Apache-2.0"
 publish = false
 
