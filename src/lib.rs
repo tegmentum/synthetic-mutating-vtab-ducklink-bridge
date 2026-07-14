@@ -43,7 +43,7 @@ mod bindings {
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
-use bindings::duckdb::extension::storage;
+use bindings::duckdb::extension::storage::{self, CompareOp, ScanFilter};
 use bindings::duckdb::extension::types::{Capabilitykind, Columndef, Duckerror, Duckvalue, Loadresult, Logicaltype};
 use bindings::exports::duckdb::extension::callback_dispatch::{self, Guest as CallbackGuest};
 use bindings::exports::duckdb::extension::guest::Guest as GuestGuest;
@@ -357,7 +357,15 @@ impl StorageDispatchGuest for Component {
         require_handle(handle)?;
         require_catalog(catalog)?;
         let st = state().lock().map_err(|_| poison())?;
-        require_table(&st, &table)?;
+        // Pre-CREATE-TABLE, DuckDB calls this to check for a name clash. Returning
+        // an error stashes a stale message in wasm-storage's last-error slot that
+        // the C++ scan-fill EOF path later re-surfaces as a fabricated failure.
+        // Return an empty column list instead: the C++ core's GetOrLoadTable
+        // treats an empty column blob as "table not found" and moves on, and
+        // last-error stays clean. Post-CREATE-TABLE calls hit the second branch.
+        if !st.created || table != TABLE_NAME {
+            return Ok(Vec::new());
+        }
         Ok(kv_schema())
     }
 
@@ -389,10 +397,21 @@ impl StorageDispatchGuest for Component {
         // Snapshot the visible view now. Later mutations don't affect an
         // already-open scan, matching sqlitewasm-component's semantic
         // (which materializes the full resultset at scan-open time).
+        //
+        // Filters MUST be applied here: DuckDB's WasmTableEntry publishes
+        // `filter_pushdown = true`, so the engine does NOT re-apply the
+        // predicates it pushes down -- an unfiltered result set is treated
+        // as authoritative and the WHERE clause never fires downstream.
+        // Apply predicates AND-wise; a filter the bridge can't evaluate
+        // (unknown column, non-text RHS) returns true so the row survives
+        // to a re-application later in the query plan.
         let src = visible_view(&st).ordered();
         let limit = request.limit.map(|n| n as usize).unwrap_or(usize::MAX);
         let mut rows: Vec<Vec<Duckvalue>> = Vec::new();
-        for (_rid, k, v) in src.iter().take(limit) {
+        for (_rid, k, v) in src.iter() {
+            if !request.filters.iter().all(|f| eval_filter(k, v, f)) {
+                continue;
+            }
             let cells: Vec<Duckvalue> = proj
                 .iter()
                 .map(|&i| match i {
@@ -402,10 +421,10 @@ impl StorageDispatchGuest for Component {
                 })
                 .collect();
             rows.push(cells);
+            if rows.len() >= limit {
+                break;
+            }
         }
-        // Filters are re-applied by the engine, so the bridge is free to
-        // ignore them (best-effort). Keeps the synthetic backend simple
-        // without violating the storage-dispatch contract.
 
         let scan_id = st.next_scan.wrapping_add(1).max(1);
         st.next_scan = scan_id;
@@ -460,6 +479,48 @@ fn kv_schema() -> Vec<Columndef> {
             logical: Logicaltype::Text,
         },
     ]
+}
+
+/// Column-scoped access for filter evaluation. Column 0 is key, 1 is value;
+/// anything else is an invariant break in the caller.
+fn kv_cell<'a>(k: &'a str, v: &'a str, column: u32) -> Option<&'a str> {
+    match column {
+        0 => Some(k),
+        1 => Some(v),
+        _ => None,
+    }
+}
+
+/// Evaluate one pushed-down filter against a materialized (key, value) pair.
+/// Text-only comparisons; a non-text `duckvalue` on the RHS returns `true`
+/// (the engine will re-apply and reject). is-null / is-not-null: our columns
+/// are declared NOT NULL semantically (INSERT with NULL is stored as ""),
+/// so is-null is always false and is-not-null always true.
+fn eval_filter(k: &str, v: &str, filter: &ScanFilter) -> bool {
+    let cell = match kv_cell(k, v, filter.column) {
+        Some(c) => c,
+        None => return true, // unknown column -> pass, engine re-applies
+    };
+    match filter.op {
+        CompareOp::IsNull => false,
+        CompareOp::IsNotNull => true,
+        op => {
+            let rhs = match &filter.value {
+                Duckvalue::Text(t) => t.as_str(),
+                Duckvalue::Null => return matches!(op, CompareOp::Ne), // != NULL is TRUE-ish
+                _ => return true, // non-text RHS: let the engine re-apply
+            };
+            match op {
+                CompareOp::Eq => cell == rhs,
+                CompareOp::Ne => cell != rhs,
+                CompareOp::Lt => cell < rhs,
+                CompareOp::Le => cell <= rhs,
+                CompareOp::Gt => cell > rhs,
+                CompareOp::Ge => cell >= rhs,
+                CompareOp::IsNull | CompareOp::IsNotNull => unreachable!(),
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------
