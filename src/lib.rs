@@ -379,9 +379,14 @@ impl StorageDispatchGuest for Component {
         let mut st = state().lock().map_err(|_| poison())?;
         require_table(&st, &request.table)?;
 
-        // Projection: full column list is [key, value]. Empty projection
-        // means all columns in natural order.
-        let proj: Vec<u32> = if request.projection.is_empty() {
+        // Projection: full column list is [key, value]. Empty projection is
+        // conventionally "all columns in natural order" -- BUT only for pure
+        // reads. When `wants_rowid` is set (the ducklink UPDATE/DELETE plan
+        // path), an empty projection means literally "no real columns, just
+        // rowid" -- the caller is asking us to emit only the trailing rowid
+        // cell. Inflating [] to [0, 1] there would over-emit and trip the
+        // host's scan-fill row-width check.
+        let proj: Vec<u32> = if request.projection.is_empty() && !request.wants_rowid {
             vec![0, 1]
         } else {
             request.projection.clone()
@@ -405,14 +410,20 @@ impl StorageDispatchGuest for Component {
         // Apply predicates AND-wise; a filter the bridge can't evaluate
         // (unknown column, non-text RHS) returns true so the row survives
         // to a re-application later in the query plan.
+        //
+        // wants-rowid (M2c UPDATE/DELETE support): when set, append a
+        // stable per-row s64 rowid as the trailing cell of every row so
+        // the scan-fill path on the host side can route it into DuckDB's
+        // rowid output slot. KvState already keys rows on rowid, so this
+        // is a direct read.
         let src = visible_view(&st).ordered();
         let limit = request.limit.map(|n| n as usize).unwrap_or(usize::MAX);
         let mut rows: Vec<Vec<Duckvalue>> = Vec::new();
-        for (_rid, k, v) in src.iter() {
+        for (rid, k, v) in src.iter() {
             if !request.filters.iter().all(|f| eval_filter(k, v, f)) {
                 continue;
             }
-            let cells: Vec<Duckvalue> = proj
+            let mut cells: Vec<Duckvalue> = proj
                 .iter()
                 .map(|&i| match i {
                     0 => Duckvalue::Text(k.clone()),
@@ -420,6 +431,9 @@ impl StorageDispatchGuest for Component {
                     _ => unreachable!(),
                 })
                 .collect();
+            if request.wants_rowid {
+                cells.push(Duckvalue::Int64(*rid));
+            }
             rows.push(cells);
             if rows.len() >= limit {
                 break;
@@ -641,6 +655,7 @@ impl StorageWriteDispatchGuest for Component {
         txn: u32,
         table: String,
         rowids: Vec<i64>,
+        updated_columns: Vec<u32>,
         rows: Vec<Vec<Duckvalue>>,
     ) -> Result<u64, Duckerror> {
         require_handle(handle)?;
@@ -651,23 +666,46 @@ impl StorageWriteDispatchGuest for Component {
                 rows.len()
             )));
         }
+        // M2c partial-row semantic: each `row` carries only the SET cells;
+        // `updated_columns[c]` names the schema-index of `row[c]`. Merge the
+        // partial row into the pre-image via KvState's existing (key,value)
+        // for the rowid, so unmentioned columns keep their prior value.
+        for col in &updated_columns {
+            if *col >= 2 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "synthetic-storage: kv_store UPDATE column {col} out of range (schema has 2 cols)"
+                )));
+            }
+        }
         let mut st = state().lock().map_err(|_| poison())?;
         require_txn(&st, txn)?;
         require_table(&st, &table)?;
         let mut updated: u64 = 0;
         for (rid, row) in rowids.iter().zip(rows.iter()) {
-            if row.len() != 2 {
+            if row.len() != updated_columns.len() {
                 return Err(Duckerror::Invalidargument(format!(
-                    "synthetic-storage: kv_store UPDATE expects 2 columns, got {}",
-                    row.len()
+                    "synthetic-storage: kv_store UPDATE row width {} != updated_columns width {}",
+                    row.len(),
+                    updated_columns.len()
                 )));
             }
-            let key = dv_to_text(&row[0])?;
-            let value = dv_to_text(&row[1])?;
             let view = current_view_mut(&mut st);
-            if view.rows.insert(*rid, (key, value)).is_some() {
-                updated += 1;
+            let existing = match view.rows.get(rid) {
+                Some(pair) => pair.clone(),
+                None => continue, // row already gone; count 0 for this rid
+            };
+            let (mut key, mut value) = existing;
+            for (c, cell) in row.iter().enumerate() {
+                let schema_idx = updated_columns[c];
+                let new_text = dv_to_text(cell)?;
+                match schema_idx {
+                    0 => key = new_text,
+                    1 => value = new_text,
+                    _ => unreachable!("bounds-checked above"),
+                }
             }
+            view.rows.insert(*rid, (key, value));
+            updated += 1;
         }
         Ok(updated)
     }
